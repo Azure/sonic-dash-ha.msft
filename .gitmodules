@@ -1,3 +1,4 @@
 [submodule "crates/sonic-dash-api-proto/sonic-dash-api"]
 	path = crates/sonic-dash-api-proto/sonic-dash-api
-	url = https://github.com/sonic-net/sonic-dash-api.git
+	url = https://github.com/Azure/sonic-dash-api.msft.git
+	branch = 202506
