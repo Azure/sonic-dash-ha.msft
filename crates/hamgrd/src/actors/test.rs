@@ -10,7 +10,7 @@ use std::{net::Ipv4Addr, net::Ipv6Addr, sync::Arc};
 use swbus_actor::{ActorMessage, ActorRuntime};
 use swbus_edge::{
     simple_client::{IncomingMessage, MessageBody, OutgoingMessage, SimpleSwbusEdgeClient},
-    swbus_proto::swbus::{ServicePath, SwbusErrorCode},
+    swbus_proto::swbus::{ConnectionType, ServicePath, SwbusErrorCode},
     SwbusEdgeRuntime,
 };
 use swss_common::{FieldValues, Table};
@@ -68,6 +68,7 @@ macro_rules! chkdb {
             key: String::from($key),
             data: serde_json::json!($data),
             exclude: "".to_string(),
+            nonexist: false,
         }
     };
 
@@ -79,6 +80,19 @@ macro_rules! chkdb {
             key: String::from($key),
             data: serde_json::json!($data),
             exclude: String::from($exclude),
+            nonexist: false,
+        }
+    };
+
+    (type: $type:ty, key: $key:expr, nonexist) => {
+        $crate::actors::test::Command::ChkDb {
+            db: String::from(<$type>::db_name()),
+            is_dpu: <$type>::is_dpu(),
+            table: String::from(<$type>::table_name()),
+            key: String::from($key),
+            data: serde_json::json!({}),
+            exclude: "".to_string(),
+            nonexist: true,
         }
     };
 
@@ -90,6 +104,19 @@ macro_rules! chkdb {
             key: String::from($key),
             data: serde_json::json!($data),
             exclude: String::from($exclude),
+            nonexist: false,
+        }
+    };
+
+    (db: $db:expr, is_dpu: $is_dpu:expr, table: $table:expr, key: $key:expr, nonexist) => {
+        $crate::actors::test::Command::ChkDb {
+            db: String::from($db),
+            is_dpu: $is_dpu,
+            table: String::from($table),
+            key: String::from($key),
+            data: serde_json::json!({}),
+            exclude: "".to_string(),
+            nonexist: true,
         }
     };
 }
@@ -114,6 +141,7 @@ pub enum Command {
         key: String,
         data: Value,
         exclude: String,
+        nonexist: bool,
     },
 }
 
@@ -136,7 +164,8 @@ pub async fn run_commands(runtime: &ActorRuntime, aut: ServicePath, commands: &[
     }
 
     // Execute commands
-    for cmd in commands {
+    for (index, cmd) in commands.iter().enumerate() {
+        let step = index + 1;
         match cmd {
             Send { key, data, addr, fail } => {
                 let client = &clients[addr];
@@ -149,7 +178,7 @@ pub async fn run_commands(runtime: &ActorRuntime, aut: ServicePath, commands: &[
                 };
                 let sent_id = client.send(msg).await.unwrap();
 
-                print!("Sent {key}, ");
+                print!("Step {step} - Sent {key}, ");
 
                 if *fail {
                     print!("expecting Fail, ");
@@ -187,7 +216,7 @@ pub async fn run_commands(runtime: &ActorRuntime, aut: ServicePath, commands: &[
 
             Recv { key, data, addr } => {
                 let client = &clients[addr];
-                print!("Receiving {key}, ");
+                print!("Step {step} - Receiving {key}, ");
                 let (am, request_id) = match timeout(client.recv()).await {
                     Ok(Some(IncomingMessage {
                         body: MessageBody::Request { payload },
@@ -224,42 +253,56 @@ pub async fn run_commands(runtime: &ActorRuntime, aut: ServicePath, commands: &[
                 key,
                 data,
                 exclude,
+                nonexist,
             } => {
+                print!("Step {step} - Checking {table_name}/{db_name} for key {key}, ");
                 let db = crate::db_named(db_name, *is_dpu).await.unwrap();
                 let mut table = Table::new(db, table_name).unwrap();
 
                 let mut last_error = None;
-
+                print!("Checking DB {db_name}/{table_name} for key {key}, ");
                 // Retry loop: 5 attempts with 100ms sleep between retries. This is needed because the previous send operation
                 // may not have been fully committed yet. send is asynchronous and may not complete immediately.
                 for attempt in 1..=5 {
                     last_error = None;
                     match table.get_async(key).await {
                         Ok(Some(mut actual_data)) => {
-                            let mut fvs: FieldValues = serde_json::from_value(data.clone()).unwrap();
-
-                            exclude
-                                .split(',')
-                                .map(str::trim)
-                                .filter(|s| !s.is_empty())
-                                .for_each(|id| {
-                                    fvs.remove(id);
-                                    actual_data.remove(id);
-                                });
-
-                            if actual_data == fvs {
-                                // Success, break out of retry loop
-                                break;
-                            } else {
+                            if *nonexist {
                                 last_error = Some(format!(
-                                    "Data mismatch on attempt {attempt}: expected {fvs:?}, got {actual_data:?}"
+                                    "Key {key} unexpectedly found in {table_name}/{db_name} on attempt {attempt} (expected nonexist)"
                                 ));
+                            } else {
+                                let mut fvs: FieldValues = serde_json::from_value(data.clone()).unwrap();
+
+                                exclude
+                                    .split(',')
+                                    .map(str::trim)
+                                    .filter(|s| !s.is_empty())
+                                    .for_each(|id| {
+                                        fvs.remove(id);
+                                        actual_data.remove(id);
+                                    });
+
+                                if actual_data == fvs {
+                                    // Success, break out of retry loop
+                                    println!("found");
+                                    break;
+                                } else {
+                                    last_error = Some(format!(
+                                        "Data mismatch on attempt {attempt}: expected {fvs:?}, got {actual_data:?}"
+                                    ));
+                                }
                             }
                         }
                         Ok(None) => {
-                            last_error = Some(format!(
-                                "Key {key} not found in {table_name}/{db_name} on attempt {attempt}"
-                            ));
+                            if *nonexist {
+                                // Success, key doesn't exist as expected
+                                break;
+                            } else {
+                                last_error = Some(format!(
+                                    "Key {key} not found in {table_name}/{db_name} on attempt {attempt}"
+                                ));
+                            }
                         }
                         Err(e) => {
                             last_error = Some(format!("Database error on attempt {attempt}: {e}"));
@@ -272,8 +315,9 @@ pub async fn run_commands(runtime: &ActorRuntime, aut: ServicePath, commands: &[
                 }
                 // If we got here and there's still an error, panic on the last attempt
                 if let Some(error) = last_error {
-                    panic!("{error}");
+                    panic!("Step {step} - {error}");
                 }
+                println!("check passed");
             }
         }
     }
@@ -283,6 +327,7 @@ pub async fn create_edge_runtime() -> SwbusEdgeRuntime {
     let mut swbus_edge: SwbusEdgeRuntime = SwbusEdgeRuntime::new(
         "none".to_string(),
         ServicePath::from_string("unknown.unknown.unknown/hamgrd/0").unwrap(),
+        ConnectionType::InNode,
     );
     swbus_edge.start().await.unwrap();
     swbus_edge
@@ -328,6 +373,7 @@ pub fn make_dpu_object(switch: u16, dpu: u32) -> Dpu {
         vip_ipv6: Some(normalize_ipv6(&format!("3:2:{switch_pair_id}::{dpu}"))),
         pa_ipv4: format!("18.0.{switch}.{dpu}"),
         pa_ipv6: Some(normalize_ipv6(&format!("18:0:{switch}::{dpu}"))),
+        local_nexthop_ip: format!("18.0.{switch}.{dpu}"),
         dpu_id: dpu,
         vdpu_id: Some(format!("vdpu{}", switch * 8 + dpu as u16)),
         orchagent_zmq_port: 8100,
@@ -407,6 +453,7 @@ pub fn to_local_dpu(dpu_actor_state: &DpuActorState) -> Dpu {
         vip_ipv6: dpu_actor_state.vip_ipv6.clone(),
         pa_ipv4: dpu_actor_state.pa_ipv4.clone(),
         pa_ipv6: dpu_actor_state.pa_ipv6.clone(),
+        local_nexthop_ip: dpu_actor_state.local_nexthop_ip.clone(),
         dpu_id: dpu_actor_state.dpu_id,
         vdpu_id: dpu_actor_state.vdpu_id.clone(),
         orchagent_zmq_port: dpu_actor_state.orchagent_zmq_port,
@@ -483,7 +530,7 @@ pub fn make_dpu_scope_ha_set_obj(switch: u16, dpu: u16) -> (String, DashHaSetTab
         vip_v4: ip_to_string(&haset_cfg.vip_v4.unwrap()),
         vip_v6: Some(ip_to_string(&haset_cfg.vip_v6.unwrap())),
         owner: None,
-        scope: Some("ha_scope_dpu".to_string()),
+        scope: Some("dpu".to_string()),
         local_npu_ip: format!("10.0.{switch}.{dpu}"),
         local_ip: format!("18.0.{switch}.{dpu}"),
         peer_ip: format!("18.0.{}.{dpu}", switch_pair_id * 2 + 1),
@@ -590,6 +637,8 @@ pub fn make_dpu_ha_scope_state(role: &str) -> DpuDashHaScopeState {
         ha_role_start_time: now_in_millis(),
         // The current term confirmed by ASIC.
         ha_term: "1".to_string(),
+        // The DPU HA state.
+        ha_state: role.to_string(),
         activate_role_pending: false,
         flow_reconcile_pending: false,
         brainsplit_recover_pending: false,

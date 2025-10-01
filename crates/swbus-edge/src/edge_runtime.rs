@@ -25,11 +25,12 @@ pub struct SwbusEdgeRuntime {
 }
 
 impl SwbusEdgeRuntime {
-    pub fn new(swbus_uri: String, sp: ServicePath) -> Self {
+    pub fn new(swbus_uri: String, sp: ServicePath, conn_type: ConnectionType) -> Self {
+        assert!(conn_type == ConnectionType::Client || conn_type == ConnectionType::InNode);
         let (local_msg_tx, local_msg_rx) = channel(SWBUS_RECV_QUEUE_SIZE);
         let (remote_msg_tx, remote_msg_rx) = channel(SWBUS_RECV_QUEUE_SIZE);
         let base_sp = sp.clone();
-        let swbus_client = SwbusCoreClient::new(swbus_uri.clone(), sp, remote_msg_tx);
+        let swbus_client = SwbusCoreClient::new(swbus_uri.clone(), sp, remote_msg_tx, conn_type);
         let tx_to_swbusd = swbus_client.send_queue_tx.clone();
         let message_router = SwbusMessageRouter::new(swbus_client, local_msg_rx, remote_msg_rx);
 
@@ -71,6 +72,28 @@ impl SwbusEdgeRuntime {
         let proxy = SwbusMessageHandlerProxy::new(handler_tx);
         info!("Added private handler for service path: {}", svc_path.to_longest_path());
         self.message_router.add_private_route(svc_path, proxy);
+    }
+
+    /// Remove handler by ServicePath.
+    pub fn remove_handler(&self, svc_path: &ServicePath) -> bool {
+        match self.message_router.remove_route(svc_path) {
+            Some(_) => {
+                info!("Removed handler for service path: {}", svc_path.to_longest_path());
+                true
+            }
+            None => {
+                info!(
+                    "No handler found to remove for service path: {}",
+                    svc_path.to_longest_path()
+                );
+                false
+            }
+        }
+    }
+
+    /// Check if a handler exists for the given ServicePath.
+    pub fn has_handler(&self, svc_path: &ServicePath) -> bool {
+        self.message_router.has_route(svc_path)
     }
 
     pub async fn send(&self, message: SwbusMessage) -> Result<()> {
@@ -128,7 +151,7 @@ mod tests {
         endpoint: "127.0.0.1:{port}"
         routes:
           - key: "region-a.cluster-a.10.0.1.0-dpu0"
-            scope: "Cluster"
+            scope: "InCluster"
         peers:
         "#
         );
@@ -187,7 +210,11 @@ mod tests {
 
         sp.service_type = "swbus-edge".to_string();
         sp.service_id = "test".to_string();
-        let mut runtime = SwbusEdgeRuntime::new(format!("http://{}", swbus_config.endpoint), sp.clone());
+        let mut runtime = SwbusEdgeRuntime::new(
+            format!("http://{}", swbus_config.endpoint),
+            sp.clone(),
+            ConnectionType::InNode,
+        );
 
         runtime.start().await.unwrap();
         let runtime = Arc::new(runtime);
@@ -222,7 +249,8 @@ mod tests {
 
         sp.service_type = "swbus-edge".to_string();
         sp.service_id = "test".to_string();
-        let mut runtime = SwbusEdgeRuntime::new(format!("http://{}", swbus_config.endpoint), sp);
+        let mut runtime =
+            SwbusEdgeRuntime::new(format!("http://{}", swbus_config.endpoint), sp, ConnectionType::InNode);
         runtime.start().await.unwrap();
 
         let base_sp = swbus_config.routes[0].key.to_swbusd_service_path().to_longest_path();

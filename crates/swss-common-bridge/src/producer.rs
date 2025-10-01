@@ -121,7 +121,7 @@ mod test {
     use swbus_actor::ActorMessage;
     use swbus_edge::{
         simple_client::{MessageBody, OutgoingMessage, SimpleSwbusEdgeClient},
-        swbus_proto::swbus::ServicePath,
+        swbus_proto::swbus::{ConnectionType, ServicePath},
         SwbusEdgeRuntime,
     };
     use swss_common::{
@@ -172,7 +172,7 @@ mod test {
 
     async fn run_test<C: ConsumerTable, P: ProducerTable>(mut consumer_table: C, producer_table: P) {
         // Setup swbus
-        let mut swbus_edge = SwbusEdgeRuntime::new("<none>".to_string(), sp("edge"));
+        let mut swbus_edge = SwbusEdgeRuntime::new("<none>".to_string(), sp("edge"), ConnectionType::InNode);
         swbus_edge.start().await.unwrap();
         let rt = Arc::new(swbus_edge);
 
@@ -209,7 +209,7 @@ mod test {
 
     async fn run_dup_test<C: ConsumerTable, P: ProducerTable>(mut consumer_table: C, producer_table: P) {
         // Setup swbus
-        let mut swbus_edge = SwbusEdgeRuntime::new("<none>".to_string(), sp("edge"));
+        let mut swbus_edge = SwbusEdgeRuntime::new("<none>".to_string(), sp("edge"), ConnectionType::InNode);
         swbus_edge.start().await.unwrap();
         let rt = Arc::new(swbus_edge);
 
@@ -268,10 +268,12 @@ mod test {
         if result.is_ok() {
             // If we got here, it means the bridge did not skip the updates
             let received = consumer_table.pops().await;
-            for kfv in received {
-                println!("Received: {}", kfv.key);
+            if !received.is_empty() {
+                for kfv in received {
+                    println!("Received: {}", kfv.key);
+                }
+                panic!("Expected bridge to skip duplicate updates, but it processed them");
             }
-            panic!("Expected bridge to skip duplicate updates, but it processed them");
         }
     }
 

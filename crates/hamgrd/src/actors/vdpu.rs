@@ -2,7 +2,7 @@ use crate::actors::dpu::DpuActor;
 use crate::actors::DbBasedActor;
 use crate::db_structs::VDpu;
 use crate::ha_actor_messages::{ActorRegistration, DpuActorState, RegistrationType, VDpuActorState};
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use sonic_common::SonicDbTable;
 use swbus_actor::Context;
 use swbus_actor::{state::incoming::Incoming, state::outgoing::Outgoing, Actor, State};
@@ -31,7 +31,22 @@ impl DbBasedActor for VDpuActor {
 }
 
 impl VDpuActor {
-    async fn register_to_dpu_actor(&self, outgoing: &mut Outgoing, active: bool) -> Result<()> {
+    fn get_dpu_actor_state(incoming: &Incoming, dpu_id: &str) -> Result<Option<DpuActorState>> {
+        let msg = incoming.get(&format!("{}{}", DpuActorState::msg_key_prefix(), dpu_id));
+        let Some(msg) = msg else {
+            // dpu data is not available yet
+            return Ok(None);
+        };
+        match msg.deserialize_data() {
+            Ok(dpu) => Ok(Some(dpu)),
+            Err(e) => {
+                error!("Failed to deserialize DpuActorState from the message: {}", e);
+                Err(e)
+            }
+        }
+    }
+
+    fn register_to_dpu_actor(&self, outgoing: &mut Outgoing, active: bool) -> Result<()> {
         if self.vdpu.is_none() {
             return Ok(());
         }
@@ -42,12 +57,20 @@ impl VDpuActor {
         Ok(())
     }
 
+    fn do_cleanup(&mut self, _context: &mut Context, state: &mut State) {
+        // unregister from the DPU Actor
+        let result = self.register_to_dpu_actor(state.outgoing(), false);
+        if result.is_err() {
+            error!("Failed to unregister from DPU Actor: {:?}", result.err());
+        }
+    }
+
     async fn handle_vdpu_message(&mut self, state: &mut State, key: &str, context: &mut Context) -> Result<()> {
         let (_internal, incoming, outgoing) = state.get_all();
-        let dpu_kfv: KeyOpFieldValues = incoming.get(key)?.deserialize_data()?;
+        let dpu_kfv: KeyOpFieldValues = incoming.get_or_fail(key)?.deserialize_data()?;
         if dpu_kfv.operation == KeyOperation::Del {
             // unregister from the DPU Actor
-            self.register_to_dpu_actor(outgoing, false).await?;
+            self.do_cleanup(context, state);
             context.stop();
             return Ok(());
         }
@@ -55,7 +78,7 @@ impl VDpuActor {
         self.vdpu = Some(swss_serde::from_field_values(&dpu_kfv.field_values)?);
 
         // Subscribe to the DPU Actor for state updates
-        self.register_to_dpu_actor(outgoing, true).await?;
+        self.register_to_dpu_actor(outgoing, true)?;
         Ok(())
     }
 
@@ -78,20 +101,14 @@ impl VDpuActor {
         }
         // only one dpu is supported for now
         let dpu_id = &self.vdpu.as_ref().unwrap().main_dpu_ids[0];
-        let msg = incoming.get(&format!("{}{}", DpuActorState::msg_key_prefix(), dpu_id));
-
-        let Ok(msg) = msg else {
-            // dpu data is not available yet
-            return None;
+        let dpu = match Self::get_dpu_actor_state(incoming, dpu_id) {
+            Ok(None) => return None,
+            Ok(Some(dpu_actor_state)) => dpu_actor_state,
+            Err(_) => return None,
         };
 
-        if let Ok(dpu) = msg.deserialize_data::<DpuActorState>() {
-            let vdpu = VDpuActorState { up: dpu.up, dpu };
-            Some(vdpu)
-        } else {
-            error!("Failed to deserialize DpuActorState from the message");
-            None
-        }
+        let vdpu = VDpuActorState { up: dpu.up, dpu };
+        Some(vdpu)
     }
 
     async fn handle_vdpu_state_registration(
@@ -100,7 +117,9 @@ impl VDpuActor {
         incoming: &Incoming,
         outgoing: &mut Outgoing,
     ) -> Result<()> {
-        let entry = incoming.get_entry(key)?;
+        let entry = incoming
+            .get_entry(key)
+            .ok_or_else(|| anyhow!("Entry not found for key: {}", key))?;
         let ActorRegistration { active, .. } = entry.msg.deserialize_data()?;
         if active {
             let Some(vdpu_state) = self.calculate_vdpu_state(incoming) else {
@@ -192,7 +211,8 @@ mod test {
 
             send! { key: VDpuActor::table_name(), data: { "key": VDpuActor::table_name(), "operation": "Del", "field_values": {"main_dpu_ids": "switch1_dpu0"}},
                     addr: crate::common_bridge_sp::<VDpu>(&runtime.get_swbus_edge()) },
-
+            recv! { key: ActorRegistration::msg_key(RegistrationType::DPUState, "test-vdpu"), data: { "active": false },
+                    addr: runtime.sp(DpuActor::name(), "switch1_dpu0") },
         ];
 
         test::run_commands(&runtime, runtime.sp(VDpuActor::name(), "test-vdpu"), &commands).await;

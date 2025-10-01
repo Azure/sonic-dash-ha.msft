@@ -9,7 +9,11 @@ use std::{
 };
 use swbus_actor::{set_global_runtime, ActorRuntime};
 use swbus_config::swbus_config_from_db;
-use swbus_edge::{simple_client::SimpleSwbusEdgeClient, swbus_proto::swbus::ServicePath, RuntimeEnv, SwbusEdgeRuntime};
+use swbus_edge::{
+    simple_client::SimpleSwbusEdgeClient,
+    swbus_proto::swbus::{ConnectionType, ServicePath},
+    RuntimeEnv, SwbusEdgeRuntime,
+};
 use swss_common::{sonic_db_config_initialize_global, DbConnector};
 use swss_common_bridge::consumer::ConsumerBridge;
 use tokio::{signal, task::JoinHandle, time::timeout};
@@ -17,10 +21,10 @@ use tracing::error;
 mod actors;
 mod db_structs;
 mod ha_actor_messages;
-use actors::spawn_zmq_producer_bridge;
 use actors::{dpu::DpuActor, ha_scope::HaScopeActor, ha_set::HaSetActor, vdpu::VDpuActor, DbBasedActor};
+use actors::{spawn_vanilla_producer_bridge, spawn_zmq_producer_bridge};
 use anyhow::Result;
-use db_structs::{BfdSessionTable, DashHaScopeTable, DashHaSetTable, Dpu, VDpu};
+use db_structs::{BfdSessionTable, DashHaScopeTable, DashHaSetTable, Dpu, VDpu, VnetRouteTunnelTable};
 use lazy_static::lazy_static;
 use sonic_dash_api_proto::{ha_scope_config::HaScopeConfig, ha_set_config::HaSetConfig};
 use std::any::Any;
@@ -63,7 +67,11 @@ async fn main() {
     let runtime_data = RuntimeData::new(args.slot_id, swbus_config.npu_ipv4, swbus_config.npu_ipv6);
 
     // Setup swbus and actor runtime
-    let mut swbus_edge = SwbusEdgeRuntime::new(format!("http://{}", swbus_config.endpoint), swbus_sp.clone());
+    let mut swbus_edge = SwbusEdgeRuntime::new(
+        format!("http://{}", swbus_config.endpoint),
+        swbus_sp.clone(),
+        ConnectionType::InNode,
+    );
     swbus_edge.set_runtime_env(Box::new(runtime_data));
 
     swbus_edge.start().await.unwrap();
@@ -144,6 +152,8 @@ async fn spawn_producer_bridges(edge_runtime: Arc<SwbusEdgeRuntime>, dpu: &Dpu) 
     let handle = spawn_zmq_producer_bridge::<DashHaScopeTable>(edge_runtime.clone(), &zmq_endpoint).await?;
     handles.push(handle);
 
+    let handle = spawn_vanilla_producer_bridge::<VnetRouteTunnelTable>(edge_runtime.clone()).await?;
+    handles.push(handle);
     Ok(handles)
 }
 
