@@ -114,7 +114,7 @@ impl SwbusNextHop {
             NextHopType::Remote => {
                 let header: &mut SwbusMessageHeader = message.header.as_mut().expect("missing header"); // should not happen otherwise it won't reach here
                 header.ttl -= 1;
-                if header.ttl == 0 {
+                if header.ttl < self.hop_count {
                     debug!("TTL expired");
                     let response = SwbusMessage::new_response(
                         message.header.as_ref().unwrap(),
@@ -195,7 +195,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_new_remote() {
-        let conn_info = Arc::new(SwbusConnInfo::new_client(
+        let conn_info = Arc::new(SwbusConnInfo::new_server(
             ConnectionType::InCluster,
             "127.0.0.1:8080".parse().unwrap(),
             ServicePath::from_string("regiona.clustera.10.0.0.2-dpu0").unwrap(),
@@ -280,7 +280,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_queue_message_remote_ttl_expired() {
-        let conn_info = Arc::new(SwbusConnInfo::new_client(
+        let conn_info = Arc::new(SwbusConnInfo::new_server(
             ConnectionType::InCluster,
             "127.0.0.1:8080".parse().unwrap(),
             ServicePath::from_string("regiona.clustera.10.0.0.2-dpu0").unwrap(),
@@ -328,7 +328,7 @@ mod tests {
 
     #[test]
     fn test_clone_with_hop_count() {
-        let conn_info = Arc::new(SwbusConnInfo::new_client(
+        let conn_info = Arc::new(SwbusConnInfo::new_server(
             ConnectionType::InCluster,
             "127.0.0.1:8080".parse().unwrap(),
             ServicePath::from_string("regiona.clustera.10.0.0.2-dpu0").unwrap(),

@@ -44,6 +44,8 @@ fn unix_secs_to_string(unix_secs: u64) -> String {
 
 impl IncomingStateDisplay {
     fn from_incoming_state((key, state): (&String, &IncomingTableEntry)) -> Self {
+        let formatted_value = Self::format_message_value(&state.msg.data);
+
         let details = vec![
             KeyValue {
                 attribute: "source".to_string(),
@@ -63,7 +65,7 @@ impl IncomingStateDisplay {
             },
             KeyValue {
                 attribute: "message/value".to_string(),
-                value: to_string_pretty(&state.msg.data).unwrap_or("INV".to_string()),
+                value: formatted_value,
             },
             KeyValue {
                 attribute: "created-time".to_string(),
@@ -87,6 +89,25 @@ impl IncomingStateDisplay {
             key: key.clone(),
             details: table,
         }
+    }
+
+    fn format_message_value(data: &serde_json::Value) -> String {
+        let formatted = Self::try_format_protobuf_json(data);
+        formatted.unwrap_or_else(|| to_string_pretty(data).unwrap_or_else(|_| "INV".to_string()))
+    }
+
+    fn try_format_protobuf_json(data: &serde_json::Value) -> Option<String> {
+        let obj = data.as_object()?;
+        let field_values = obj.get("field_values")?.as_object()?;
+        let json_str = field_values.get("json")?.as_str()?;
+
+        let parsed = serde_json::from_str::<serde_json::Value>(json_str).ok()?;
+
+        let mut new_obj = obj.clone();
+        let new_field_values = new_obj.get_mut("field_values")?.as_object_mut()?;
+        new_field_values.insert("json".to_string(), parsed);
+
+        to_string_pretty(&new_obj).ok()
     }
 }
 
@@ -227,7 +248,7 @@ impl InternalStateDisplay {
         ];
         let table_meta = Table::new(table_meta).with(Style::ascii().remove_frame()).to_string();
 
-        let committed_fvs = state
+        let mut committed_fvs = state
             .backup_fvs
             .iter()
             .map(|(key, value)| KeyValue {
@@ -235,6 +256,8 @@ impl InternalStateDisplay {
                 value: value.to_string_lossy().into_owned(),
             })
             .collect::<Vec<KeyValue>>();
+
+        committed_fvs.sort_by(|a, b| a.attribute.cmp(&b.attribute));
 
         let committed_fvs = Table::new(committed_fvs)
             .with(Style::ascii().remove_frame())
@@ -272,11 +295,14 @@ impl ShowCmdHandler for ShowActorCmd {
         let state: ActorStateDump = serde_json::from_str(result).unwrap();
 
         // convert to table for display
-        let incoming_state_display = state
+        let mut incoming_state_display: Vec<IncomingStateDisplay> = state
             .incoming
             .iter()
             .map(IncomingStateDisplay::from_incoming_state)
             .collect::<Vec<IncomingStateDisplay>>();
+
+        incoming_state_display.sort_by(|a, b| a.key.cmp(&b.key));
+
         let incoming_state_table = Table::new(incoming_state_display)
             .with(Panel::header("Incoming State"))
             .with(Modify::list(Rows::first(), Alignment::center()))
@@ -286,11 +312,14 @@ impl ShowCmdHandler for ShowActorCmd {
         info!("{}", incoming_state_table);
 
         // convert to table for display
-        let internal_state_display = state
+        let mut internal_state_display = state
             .internal
             .iter()
             .map(InternalStateDisplay::from_internal_state)
             .collect::<Vec<InternalStateDisplay>>();
+
+        internal_state_display.sort_by(|a, b| a.key.cmp(&b.key));
+
         let internal_state_table = Table::new(internal_state_display)
             .with(Panel::header("Internal State"))
             .with(Modify::list(Rows::first(), Alignment::center()))
@@ -300,12 +329,15 @@ impl ShowCmdHandler for ShowActorCmd {
         info!("{}", internal_state_table);
 
         // convert to table for display
-        let outgoing_sent_state_display = state
+        let mut outgoing_sent_state_display = state
             .outgoing
             .outgoing_sent
             .iter()
             .map(OutgoingSentStateDisplay::from_outgoing_state)
             .collect::<Vec<OutgoingSentStateDisplay>>();
+
+        outgoing_sent_state_display.sort_by(|a, b| a.key.cmp(&b.key));
+
         let outgoing_sent_state_table = Table::new(outgoing_sent_state_display)
             .with(Panel::header("Outgoing Sent Message State"))
             .with(Modify::list(Rows::first(), Alignment::center()))

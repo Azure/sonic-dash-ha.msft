@@ -199,8 +199,8 @@ impl HaSetActor {
 
         for vdpu_ext in vdpus {
             if !vdpu_ext.vdpu.dpu.remote_dpu {
-                // if it is locally managed dpu, use local nexthop as endpoint
-                endpoint.push(vdpu_ext.vdpu.dpu.local_nexthop_ip.clone());
+                // if it is locally managed dpu, use PA address as endpoint
+                endpoint.push(vdpu_ext.vdpu.dpu.pa_ipv4.clone());
             } else {
                 endpoint.push(vdpu_ext.vdpu.dpu.npu_ipv4.clone());
             }
@@ -208,7 +208,7 @@ impl HaSetActor {
             endpoint_monitor.push(vdpu_ext.vdpu.dpu.pa_ipv4.clone());
             if vdpu_ext.is_primary {
                 if !vdpu_ext.vdpu.dpu.remote_dpu {
-                    primary.push(vdpu_ext.vdpu.dpu.local_nexthop_ip.clone());
+                    primary.push(vdpu_ext.vdpu.dpu.pa_ipv4.clone());
                 } else {
                     primary.push(vdpu_ext.vdpu.dpu.npu_ipv4.clone());
                 }
@@ -228,7 +228,7 @@ impl HaSetActor {
         let vnet_route = VnetRouteTunnelTable {
             endpoint,
             endpoint_monitor: Some(endpoint_monitor),
-            monitoring: None,
+            monitoring: Some("custom_bfd".into()),
             primary: Some(primary),
             rx_monitor_timer: global_cfg.dpu_bfd_probe_interval_in_ms,
             tx_monitor_timer: global_cfg.dpu_bfd_probe_interval_in_ms,
@@ -564,7 +564,7 @@ mod test {
                 vdpu0_state_obj.dpu.pa_ipv4.clone(),
                 vdpu1_state_obj.dpu.pa_ipv4.clone(),
             ]),
-            monitoring: None,
+            monitoring: Some("custom_bfd".into()),
             primary: Some(vec![vdpu0_state_obj.dpu.pa_ipv4.clone()]),
             rx_monitor_timer: global_cfg.dpu_bfd_probe_interval_in_ms,
             tx_monitor_timer: global_cfg.dpu_bfd_probe_interval_in_ms,
@@ -657,7 +657,7 @@ mod test {
                 vdpu0_state_obj.dpu.pa_ipv4.clone(),
                 vdpu1_state_obj.dpu.pa_ipv4.clone(),
             ]),
-            monitoring: None,
+            monitoring: Some("custom_bfd".into()),
             primary: Some(vec![vdpu0_state_obj.dpu.npu_ipv4.clone()]),
             rx_monitor_timer: global_cfg.dpu_bfd_probe_interval_in_ms,
             tx_monitor_timer: global_cfg.dpu_bfd_probe_interval_in_ms,

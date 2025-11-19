@@ -29,7 +29,7 @@ impl std::fmt::Display for RouteAnnounceTask {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(
             f,
-            "trigger: {:?}, conn_info: {}",
+            "trigger: {:?}, conn_info: {:?}",
             self.trigger,
             self.conn_info.remote_service_path()
         )
@@ -88,7 +88,7 @@ impl RouteAnnouncer {
                 .await
                 .map_err(|e| {
                     error!(
-                        "Failed to send route announcement to {}: {}",
+                        "Failed to send route announcement to {:?}: {}",
                         conn_info.remote_service_path(),
                         e
                     );
@@ -98,8 +98,12 @@ impl RouteAnnouncer {
 
     #[instrument(name = "send_route_announcement", level = "debug", skip_all)]
     async fn send_route_announcement(&self, conn_info: &SwbusConnInfo, routes: &RouteEntries) -> Result<()> {
-        let dest_sp = conn_info.remote_service_path().clone();
-        let msg = SwbusMessage {
+        let dest_sp = conn_info
+            .remote_service_path()
+            .as_ref()
+            .expect("remote_service_path should be set")
+            .clone();
+        let mut msg = SwbusMessage {
             header: Some(SwbusMessageHeader::new(
                 self.mux.get_my_service_path().clone(),
                 dest_sp,
@@ -107,8 +111,10 @@ impl RouteAnnouncer {
             )),
             body: Some(swbus_message::Body::RouteAnnouncement(routes.clone())),
         };
+        // count itself as 1 hop. The message is only meant for direct neighbors
+        msg.header.as_mut().unwrap().ttl = 2;
         debug!(
-            "Sending route announcement to {}, conn_info {:?}, message {:?}",
+            "Sending route announcement to {:?}, conn_info {:?}, message {:?}",
             conn_info.remote_service_path(),
             conn_info,
             &msg
@@ -167,7 +173,7 @@ mod tests {
             "header": {
                 "version": 1,
                 "flag": 0,
-                "ttl": 63,
+                "ttl": 1,
                 "source": "region-a.cluster-a.node0",
                 "destination": "region-a.cluster-a.node1"
             },
@@ -211,7 +217,7 @@ mod tests {
             "header": {
                 "version": 1,
                 "flag": 0,
-                "ttl": 63,
+                "ttl": 1,
                 "source": "region-a.cluster-a.node0",
                 "destination": "region-a.cluster-a.node2"
             },

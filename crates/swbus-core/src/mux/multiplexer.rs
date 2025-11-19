@@ -153,19 +153,35 @@ impl SwbusMultiplexer {
 
     /// get route from conn_info based on connection type. This is a direct route which means it is to a immediate nexthop (1 hop away).
     fn route_from_conn(&self, conn_info: &Arc<SwbusConnInfo>) -> String {
+        let remote_sp = conn_info
+            .remote_service_path()
+            .as_ref()
+            .expect("remote_service_path should be set");
         match conn_info.connection_type() {
             // direct route Global, InRegion, InCluster connection type is always to node level
             ConnectionType::Global | ConnectionType::InRegion | ConnectionType::InCluster => {
-                conn_info.remote_service_path().to_incluster_prefix()
+                remote_sp.to_incluster_prefix()
             }
             // both Client (for CLI) and InNode route by service prefix. IOW, service prefix uniquely
             // identify the endpoint to the client (CLI or hamgrd)
-            ConnectionType::InNode | ConnectionType::Client => conn_info.remote_service_path().to_service_prefix(),
+            ConnectionType::InNode | ConnectionType::Client => remote_sp.to_service_prefix(),
         }
     }
 
     pub(crate) fn register(&self, conn_info: &Arc<SwbusConnInfo>, proxy: SwbusConnProxy) {
         // Update the route table.
+        let remote_sp = conn_info
+            .remote_service_path()
+            .as_ref()
+            .expect("remote_service_path should be set");
+        if self.my_routes.contains_key(remote_sp) {
+            error!(
+                "Conflicting service path to my routes detected from connection: {}",
+                conn_info.id()
+            );
+            return;
+        }
+
         let direct_route = self.route_from_conn(conn_info);
 
         let nexthop = SwbusNextHop::new_remote(conn_info.clone(), proxy, 1);
@@ -205,7 +221,7 @@ impl SwbusMultiplexer {
             match Self::key_from_route_entry(entry) {
                 Ok(route_key) => {
                     let old_nh = dummy_nh.clone_with_hop_count(entry.hop_count + 1);
-                    let route_removed = self.remove_route_to_nh(&route_key, &old_nh);
+                    let (_, route_removed) = self.remove_route_to_nh(&route_key, &old_nh);
                     if route_removed {
                         need_announce = true;
                     }
@@ -217,7 +233,7 @@ impl SwbusMultiplexer {
         }
 
         // remove the direct route
-        let route_removed = self.remove_route_to_nh(&direct_route, &dummy_nh);
+        let (_, route_removed) = self.remove_route_to_nh(&direct_route, &dummy_nh);
         if route_removed {
             need_announce = true;
         }
@@ -236,34 +252,42 @@ impl SwbusMultiplexer {
         }
     }
 
-    // Update route for the give service path with the new nexthop. If the route is updated, return true.
-    // Otherwise, return false.
+    // Update route for the give service path with the new nexthop. It returns a tuple of (nh_added, route_added).
+    // if inserted is true, the nexthop is newly inserted or updated (hop count changed).
+    // if route_added is true, the route entry is newly created.
     #[instrument(name = "update_route", level = "info", skip(self, nexthop), fields(nh_type=?nexthop.nh_type(), hop_count=nexthop.hop_count(), conn_info=nexthop.conn_info().as_ref().map(|x| x.id()).unwrap_or(&"None".to_string())))]
-    fn update_route(&self, route_key: String, nexthop: SwbusNextHop) -> bool {
+    fn update_route(&self, route_key: String, nexthop: SwbusNextHop) -> (bool, bool) {
         // If route entry doesn't exist, we insert the next hop as a new one.
-        let inserted = self.routes.entry(route_key).or_default().insert(nexthop.clone());
-        info!("Update route entry: inserted={}", inserted);
-        inserted
+        let mut route_added = false;
+        if self.routes.get(&route_key).is_none() {
+            route_added = true;
+        }
+        let nh_added = self.routes.entry(route_key).or_default().insert(nexthop.clone());
+        info!("Update route entry: nh_added={nh_added}, route_added={route_added}");
+        (nh_added, route_added)
     }
 
     /// remove a specified route and to the specified nexthop
+    /// It returns a tuple of (nh_removed, route_removed).
+    /// if nh_removed is true, the nexthop is removed.
+    /// if route_removed is true, the route entry is completely removed.
     #[instrument(name = "remove_route_to_nh", level = "info", skip(self, nexthop), fields(nh_type=?nexthop.nh_type(), hop_count=nexthop.hop_count(), conn_info=nexthop.conn_info().as_ref().map(|x| x.id()).unwrap_or(&"None".to_string())))]
-    fn remove_route_to_nh(&self, route_key: &str, nexthop: &SwbusNextHop) -> bool {
-        let mut removed = false;
-        let mut remove_all = false;
+    fn remove_route_to_nh(&self, route_key: &str, nexthop: &SwbusNextHop) -> (bool, bool) {
+        let mut nh_removed = false;
+        let mut route_removed = false;
         if let Some(mut entry) = self.routes.get_mut(route_key) {
-            removed = entry.remove(nexthop);
+            nh_removed = entry.remove(nexthop);
             if entry.is_empty() {
-                remove_all = true;
+                route_removed = true;
                 // can't remove route here because we are holding the lock on the entry.
             }
         }
-        if remove_all {
+        if route_removed {
             self.routes.remove(route_key);
         }
 
-        info!("Remove route entry: removed={}", removed);
-        removed
+        info!("Remove route entry: nh_removed={nh_removed}, route_removed={route_removed}");
+        (nh_removed, route_removed)
     }
 
     /// remove a specified route
@@ -284,7 +308,7 @@ impl SwbusMultiplexer {
             SwbusError::internal(
                 SwbusErrorCode::Fail,
                 format!(
-                    "Receive route announcement from {} but route to the connection {} is not found ",
+                    "Receive route announcement from {:?} but route to the connection {} is not found ",
                     conn_info.remote_service_path(),
                     direct_route
                 ),
@@ -302,7 +326,7 @@ impl SwbusMultiplexer {
             Err(SwbusError::internal(
                 SwbusErrorCode::Fail,
                 format!(
-                    "Receive route announcement from {} but nh of the route is not from same connection: {}",
+                    "Receive route announcement from {:?} but nh of the route is not from same connection: {}",
                     conn_info.remote_service_path(),
                     direct_route
                 ),
@@ -337,7 +361,7 @@ impl SwbusMultiplexer {
         conn_info: &Arc<SwbusConnInfo>,
     ) -> Result<()> {
         debug!(
-            "Begin processing route announcement from {}",
+            "Begin processing route announcement from {:?}",
             conn_info.remote_service_path()
         );
 
@@ -350,7 +374,7 @@ impl SwbusMultiplexer {
         for entry in routes.entries.into_iter() {
             if entry.service_path.is_none() {
                 error!(
-                    "Received route announcement with missing service path from {}",
+                    "Received route announcement with missing service path from {:?}",
                     conn_info.remote_service_path()
                 );
                 continue;
@@ -377,7 +401,7 @@ impl SwbusMultiplexer {
                 }
             };
             let old_nh = nh.clone_with_hop_count(entry.hop_count + 1);
-            let route_removed = self.remove_route_to_nh(&route_key, &old_nh);
+            let (_, route_removed) = self.remove_route_to_nh(&route_key, &old_nh);
             if route_removed {
                 need_announce = true;
             }
@@ -394,8 +418,8 @@ impl SwbusMultiplexer {
             };
             let new_nh = nh.clone_with_hop_count(entry.hop_count + 1);
 
-            let route_changed = self.update_route(route_key, new_nh);
-            if route_changed {
+            let (_, route_added) = self.update_route(route_key, new_nh);
+            if route_added {
                 need_announce = true;
             }
         }
@@ -406,7 +430,7 @@ impl SwbusMultiplexer {
         }
         *old_routes = new_routes;
         debug!(
-            "Finished processing route announcement from {}",
+            "Finished processing route announcement from {:?}",
             conn_info.remote_service_path()
         );
         Ok(())
@@ -547,7 +571,7 @@ impl SwbusMultiplexer {
                         ),
                         hop_count: nh.hop_count(),
                         nh_id: nh.conn_info().as_ref().unwrap().id().to_string(),
-                        nh_service_path: Some(nh.conn_info().as_ref().unwrap().remote_service_path().clone()),
+                        nh_service_path: nh.conn_info().as_ref().unwrap().remote_service_path().clone(),
                         route_scope: ServicePath::from_string(entry.key()).unwrap().route_scope() as i32,
                     })
                     .collect::<Vec<RouteEntry>>()
@@ -680,7 +704,7 @@ pub mod test_utils {
         sp: &str,
         nh_endpoint: &str,
     ) -> (SwbusConn, mpsc::Receiver<Result<SwbusMessage, Status>>) {
-        let conn_info = Arc::new(SwbusConnInfo::new_client(
+        let conn_info = Arc::new(SwbusConnInfo::new_server(
             conn_type,
             nh_endpoint.parse().unwrap(),
             ServicePath::from_string(sp).unwrap(),
@@ -696,12 +720,13 @@ pub mod test_utils {
         conn: &SwbusConn,
     ) -> Option<RouteEntry> {
         let nexthop_nh1 = SwbusNextHop::new_remote(conn.info().clone(), conn.new_proxy(), hop_count);
-        if mux.update_route(route_key.to_string(), nexthop_nh1) {
+        let (nh_added, _) = mux.update_route(route_key.to_string(), nexthop_nh1);
+        if nh_added {
             Some(RouteEntry {
                 service_path: Some(ServicePath::from_string(route_key).unwrap()),
                 hop_count,
                 nh_id: conn.info().id().to_string(),
-                nh_service_path: Some(conn.info().remote_service_path().clone()),
+                nh_service_path: conn.info().remote_service_path().clone(),
                 route_scope: ServicePath::from_string(route_key).unwrap().route_scope() as i32,
             })
         } else {
@@ -1160,28 +1185,28 @@ mod tests {
         add_route(&mux, "region-a.cluster-a.node1", 1, &conn1).unwrap();
         let conn1_nh = SwbusNextHop::new_remote(conn1.info().clone(), conn1.new_proxy(), 1);
 
-        // create some route entries
+        // create some route entries for node 1
         // route entry matches my routes. Should be skipped
-        let node1_re1 = new_route_entry_for_ra("region-a.cluster-a.node1", 0);
+        let n1_node1_re1 = new_route_entry_for_ra("region-a.cluster-a.node1", 0);
         // negative test: route announcement with scope lower than InCluster
-        let node1_re2 = new_route_entry_for_ra("region-a.cluster-a.node1/ha/0", 1);
-        let node2_re1 = new_route_entry_for_ra("region-a.cluster-a.node2", 1);
-        let clusterb_re1 = new_route_entry_for_ra("region-a.cluster-b", 2);
+        let n1_node1_re2 = new_route_entry_for_ra("region-a.cluster-a.node1/ha/0", 1);
+        let n1_node2_re1 = new_route_entry_for_ra("region-a.cluster-a.node2", 1);
+        let n1_clusterb_re1 = new_route_entry_for_ra("region-a.cluster-b", 2);
 
-        // Step1: process a route announcement
+        // Step1: process a route announcement from node1
         let routes = RouteEntries {
             entries: vec![
-                node1_re1.clone(),
-                node1_re2.clone(),
-                node2_re1.clone(),
-                clusterb_re1.clone(),
+                n1_node1_re1.clone(),
+                n1_node1_re2.clone(),
+                n1_node2_re1.clone(),
+                n1_clusterb_re1.clone(),
             ],
         };
         let expected_route_entries = BTreeSet::from_iter(vec![
-            node1_re1.clone(),
-            node1_re2.clone(),
-            node2_re1.clone(),
-            clusterb_re1.clone(),
+            n1_node1_re1.clone(),
+            n1_node1_re2.clone(),
+            n1_node2_re1.clone(),
+            n1_clusterb_re1.clone(),
         ]);
         mux.process_route_announcement(routes.clone(), conn1.info()).unwrap();
         // Expect:
@@ -1196,15 +1221,15 @@ mod tests {
             BTreeSet::from([SwbusNextHop::new_local()]),
         );
         expected.insert(
-            SwbusMultiplexer::key_from_route_entry(&node1_re1).unwrap(),
+            SwbusMultiplexer::key_from_route_entry(&n1_node1_re1).unwrap(),
             BTreeSet::from([conn1_nh.clone_with_hop_count(1)]),
         );
         expected.insert(
-            SwbusMultiplexer::key_from_route_entry(&node2_re1).unwrap(),
+            SwbusMultiplexer::key_from_route_entry(&n1_node2_re1).unwrap(),
             BTreeSet::from([conn1_nh.clone_with_hop_count(2)]),
         );
         expected.insert(
-            SwbusMultiplexer::key_from_route_entry(&clusterb_re1).unwrap(),
+            SwbusMultiplexer::key_from_route_entry(&n1_clusterb_re1).unwrap(),
             BTreeSet::from([conn1_nh.clone_with_hop_count(3)]),
         );
 
@@ -1223,7 +1248,7 @@ mod tests {
             assert_eq!(*routes_by_conn, expected_route_entries);
         }
 
-        // Step 2: process a route announcement with the same routes
+        // Step 2: process a route announcement with the same routes from node1
         mux.process_route_announcement(routes.clone(), conn1.info()).unwrap();
         // Expect:
         //   1. no route is updated
@@ -1240,16 +1265,16 @@ mod tests {
         // process a route announcement
         let routes = RouteEntries {
             entries: vec![
-                node1_re1.clone(),
-                node1_re2.clone(),
+                n1_node1_re1.clone(),
+                n1_node1_re2.clone(),
                 node2_re1_changed.clone(),
                 clusterb_re1.clone(),
                 node3_re1.clone(),
             ],
         };
         let expected_route_entries = BTreeSet::from_iter(vec![
-            node1_re1.clone(),
-            node1_re2.clone(),
+            n1_node1_re1.clone(),
+            n1_node1_re2.clone(),
             node2_re1_changed.clone(),
             clusterb_re1.clone(),
             node3_re1.clone(),
@@ -1261,7 +1286,7 @@ mod tests {
             BTreeSet::from([SwbusNextHop::new_local()]),
         );
         expected.insert(
-            SwbusMultiplexer::key_from_route_entry(&node1_re1).unwrap(),
+            SwbusMultiplexer::key_from_route_entry(&n1_node1_re1).unwrap(),
             BTreeSet::from([conn1_nh.clone_with_hop_count(1)]),
         );
         expected.insert(
@@ -1297,6 +1322,74 @@ mod tests {
             let routes_by_conn = mux.routes_by_conn.get(conn1.info()).unwrap();
             assert_eq!(*routes_by_conn, expected_route_entries);
         }
+        let expected_before_node2 = expected.clone();
+        // Step 4: process a route announcement from node2
+        // add a direct route to the node2
+        let (conn2, _) =
+            new_conn_for_test_with_endpoint(ConnectionType::InCluster, "region-a.cluster-a.node2", "127.0.0.1:8081");
+        add_route(&mux, "region-a.cluster-a.node2", 1, &conn2).unwrap();
+        let conn2_nh = SwbusNextHop::new_remote(conn2.info().clone(), conn2.new_proxy(), 1);
+
+        // create some route entries for node 2
+        let n2_node1_re1 = new_route_entry_for_ra("region-a.cluster-a.node1", 1);
+        let n2_clusterb_re1 = new_route_entry_for_ra("region-a.cluster-b", 2);
+
+        let routes = RouteEntries {
+            entries: vec![n2_node1_re1.clone(), n2_clusterb_re1.clone()],
+        };
+        mux.process_route_announcement(routes.clone(), conn2.info()).unwrap();
+
+        // Expect:
+        //   1. no route anouncement task is created as no new route is added
+        //   2. route_entries are updated with new paths
+        expected
+            .entry(SwbusMultiplexer::key_from_route_entry(&n1_node2_re1).unwrap())
+            .or_default()
+            .insert(conn2_nh.clone_with_hop_count(1));
+        expected
+            .entry(SwbusMultiplexer::key_from_route_entry(&n2_node1_re1).unwrap())
+            .or_default()
+            .insert(conn2_nh.clone_with_hop_count(2));
+        expected
+            .entry(SwbusMultiplexer::key_from_route_entry(&n2_clusterb_re1).unwrap())
+            .or_default()
+            .insert(conn2_nh.clone_with_hop_count(3));
+        let actual: HashMap<String, BTreeSet<SwbusNextHop>> = mux
+            .routes
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .collect();
+        assert_eq!(actual, expected);
+        assert_eq!(
+            route_announce_task_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        );
+
+        // Step 5: process a route announcement with routes removed from node2
+        // Expect:
+        //   1. no route anouncement task is created as only paths are removed but no route is removed
+        //   2. route_entries are updated with paths removed
+        let routes = RouteEntries { entries: vec![] };
+        mux.process_route_announcement(routes.clone(), conn2.info()).unwrap();
+
+        let mut expected = expected_before_node2.clone();
+        expected
+            .entry(SwbusMultiplexer::key_from_route_entry(&n1_node2_re1).unwrap())
+            .or_default()
+            .insert(conn2_nh.clone_with_hop_count(1));
+
+        let actual: HashMap<String, BTreeSet<SwbusNextHop>> = mux
+            .routes
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .collect();
+
+        assert_eq!(actual, expected);
+
+        assert_eq!(
+            route_announce_task_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        );
     }
 
     #[tokio::test]
@@ -1312,7 +1405,7 @@ mod tests {
         add_route(&mux, "region-a.cluster-a.10.0.0.1-dpu0", 1, &conn1).unwrap();
 
         // add the same route with a different connection
-        let conn_info = Arc::new(SwbusConnInfo::new_client(
+        let conn_info = Arc::new(SwbusConnInfo::new_server(
             ConnectionType::InCluster,
             "127.0.0.1:8081".parse().unwrap(),
             ServicePath::from_string("region-a.cluster-a.10.0.0.1-dpu0").unwrap(),
@@ -1365,9 +1458,9 @@ mod tests {
         add_route(&mux, route_key, 1, &conn2).unwrap();
         let nexthop2 = SwbusNextHop::new_remote(conn2.info().clone(), conn2.new_proxy(), 1);
 
-        assert!(mux.remove_route_to_nh(route_key, &nexthop1));
+        assert!(mux.remove_route_to_nh(route_key, &nexthop1).0);
         assert!(mux.routes.contains_key(route_key));
-        assert!(mux.remove_route_to_nh(route_key, &nexthop2));
+        assert!(mux.remove_route_to_nh(route_key, &nexthop2).0);
 
         assert!(!mux.routes.contains_key(route_key)); // Ensure route is removed when empty
     }
@@ -1395,7 +1488,8 @@ mod tests {
         );
         let nexthop2 = SwbusNextHop::new_remote(conn2.info().clone(), conn2.new_proxy(), 1);
 
-        assert!(!mux.remove_route_to_nh(route_key, &nexthop2));
+        let (nh_remove, route_removed) = mux.remove_route_to_nh(route_key, &nexthop2);
+        assert!(!nh_remove && !route_removed);
 
         assert!(mux.routes.contains_key(route_key)); // Ensure route is not removed
     }
@@ -1500,5 +1594,31 @@ mod tests {
             ))
         );
         assert!(!mux.connections.contains(conn1.info()));
+    }
+
+    #[test]
+    fn test_register_with_conflict_sp() {
+        // create mux
+        // create a mux with my routes and add a dummy route announcer
+        // create a mux with 2 my-routes
+        let my_route1 = RouteConfig {
+            key: ServicePath::from_string("region-a.cluster-a.node0").unwrap(),
+            scope: RouteScope::InCluster,
+        };
+        let mut mux = SwbusMultiplexer::new(vec![my_route1.clone()]);
+        let (route_announce_task_tx, _) = mpsc::channel(16);
+        mux.set_route_announcer(route_announce_task_tx, CancellationToken::new());
+        let mux = Arc::new(mux);
+
+        // register a connection
+        let (conn1, _) = new_conn_for_test(ConnectionType::InCluster, "region-a.cluster-a.node0");
+        mux.register(conn1.info(), conn1.new_proxy());
+        let route_key = mux.route_from_conn(conn1.info());
+        // make the conflicting route is not added
+        if let Some(nh_set) = mux.routes.get(&route_key) {
+            assert!(!nh_set
+                .iter()
+                .any(|nh| nh.nh_type() == NextHopType::Remote && nh.conn_info().as_ref().unwrap() == conn1.info()));
+        };
     }
 }

@@ -36,6 +36,10 @@ where
         mux: Arc<SwbusMultiplexer>,
         conn_store: Arc<SwbusConnStore>,
     ) -> Self {
+        assert!(
+            info.remote_service_path().is_some(),
+            "remote_service_path must be set before creating SwbusConnWorker"
+        );
         Self {
             info,
             shutdown_ct,
@@ -59,7 +63,7 @@ where
         self.unregister_from_mux()?;
         if result.is_err() {
             info!("Reporting connection lost.");
-            self.conn_store.conn_lost(self.info.clone());
+            self.conn_store.conn_lost(&self.info);
         }
         result
     }
@@ -148,9 +152,15 @@ where
                 }
             }
             Some(swbus_message::Body::RouteAnnouncement(route_entries)) => {
-                // drop route announcement message
-                debug!("Received route announcement");
-                self.mux.process_route_announcement(route_entries, &self.info)?;
+                let my_sp = self.mux.get_my_service_path();
+                if message.header.as_ref().unwrap().destination.as_ref().unwrap() == my_sp {
+                    // Message is destined for this service, process it locally
+                    debug!("Received route announcement");
+                    self.mux.process_route_announcement(route_entries, &self.info)?;
+                } else {
+                    // drop route announcement message
+                    debug!("Dropping route announcement not destined for me");
+                }
             }
             Some(swbus_message::Body::ManagementRequest(ref mgmt_request)) => {
                 let my_sp = self.mux.get_my_service_path();
@@ -264,7 +274,7 @@ mod tests {
         let mux = Arc::new(SwbusMultiplexer::new(vec![route_config]));
         let conn_store = Arc::new(SwbusConnStore::new(mux.clone()));
 
-        let conn_info = Arc::new(SwbusConnInfo::new_client(
+        let conn_info = Arc::new(SwbusConnInfo::new_server(
             ConnectionType::InCluster,
             "127.0.0.1:8080".parse().unwrap(),
             ServicePath::from_string("regiona.clustera.10.0.0.2-dpu0").unwrap(),
@@ -301,7 +311,7 @@ mod tests {
         let mux = Arc::new(SwbusMultiplexer::new(vec![route_config]));
         let conn_store = Arc::new(SwbusConnStore::new(mux.clone()));
 
-        let conn_info = Arc::new(SwbusConnInfo::new_client(
+        let conn_info = Arc::new(SwbusConnInfo::new_server(
             ConnectionType::InCluster,
             "127.0.0.1:8080".parse().unwrap(),
             ServicePath::from_string("regiona.clustera.10.0.0.2-dpu0").unwrap(),
@@ -328,7 +338,7 @@ mod tests {
         let mux = Arc::new(SwbusMultiplexer::new(vec![route_config]));
         let conn_store = Arc::new(SwbusConnStore::new(mux.clone()));
 
-        let conn_info = Arc::new(SwbusConnInfo::new_client(
+        let conn_info = Arc::new(SwbusConnInfo::new_server(
             ConnectionType::InCluster,
             "127.0.0.1:8080".parse().unwrap(),
             ServicePath::from_string("regiona.clustera.10.0.0.2-dpu0").unwrap(),
